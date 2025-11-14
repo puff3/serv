@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""
+- Host: ~/.serv host --port 9009 --nick alice
+- Connect: ~/.serv connect HOST --port 9009 --nick bob
+- Change nick globally: /nick newname
+- All messages end-to-end encrypted (server cannot decrypt)
+"""
+
+import os, sys, socket, threading, select, json, secrets, base64, time, hashlib, hmac, getpass, termios, tty
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Tuple
+
+# Cryptography imports
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import serialization
+except Exception:
+    print("cryptography required. Install: pip3 install cryptography")
+    sys.exit(1)
+
+# ANSI colors
+ANSI_RESET  = "\033[0m"
+ANSI_BOLD   = "\033[1m"
+ANSI_DIM    = "\033[2m"
+ANSI_RED    = "\033[1;31m"    # host
+ANSI_YELLOW = "\033[1;33m"    # dev
+ANSI_CYAN   = "\033[36m"      # user
+ANSI_TIME   = "\033[90m"      # timestamp
+
+HISTORY_FILE = Path.home() / ".serv.history"
+SERVAUTH_FILENAME = ".servauth"  # Master auth file - DO NOT SHARE
+
+# PBKDF2 settings
+_PBKDF2_ITER = 200_000
+_PBKDF2_ALG = "sha256"
+_SALT_BYTES = 16
+_DKLEN = 32
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def save_history(line: str):
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+def load_servauth(script_dir: str) -> Optional[dict]:
+    """Load master auth file - contains password hash for dev authentication"""
+    path = Path(script_dir) / SERVAUTH_FILENAME
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        return data
+    except Exception:
+        return None
+
+def save_servauth(script_dir: str, data: dict) -> bool:
+    """Save master auth file - should NEVER be committed to version control"""
+    path = Path(script_dir) / SERVAUTH_FILENAME
+    try:
+        path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        # make file readable/writable only by owner
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+def remove_servauth(script_dir: str) -> bool:
+    path = Path(script_dir) / SERVAUTH_FILENAME
+    try:
+        if path.exists():
+            path.unlink()
+        return True
+    except Exception:
+        return False
+
+# --- Password hashing helpers ---
+def _pbkdf2_hash(password: str, salt: bytes, iterations: int = _PBKDF2_ITER) -> bytes:
+    """Return raw derived key bytes"""
+    return hashlib.pbkdf2_hmac(_PBKDF2_ALG, password.encode("utf-8"), salt, iterations, dklen=_DKLEN)
+
+def make_servauth_blob(nick: str, password: str) -> dict:
+    """Create hash for .servauth file (master password)"""
+    salt = secrets.token_bytes(_SALT_BYTES)
+    dk = _pbkdf2_hash(password, salt, _PBKDF2_ITER)
+    return {
+        "nick": nick,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "iter": _PBKDF2_ITER,
+        "hash": base64.b64encode(dk).decode("ascii"),
+        "alg": f"pbkdf2-{_PBKDF2_ALG}"
+    }
+
+def verify_servauth_blob(blob: dict, password: str) -> bool:
+    try:
+        salt = base64.b64decode(blob["salt"])
+        itercount = int(blob.get("iter", _PBKDF2_ITER))
+        expected = base64.b64decode(blob["hash"])
+        dk = _pbkdf2_hash(password, salt, itercount)
+        # constant-time compare
+        return secrets.compare_digest(dk, expected)
+    except Exception:
+        return False
+
+# --- Cryptography helpers ---
+def generate_x25519_keypair() -> Tuple[X25519PrivateKey, X25519PublicKey]:
+    private = X25519PrivateKey.generate()
+    public = private.public_key()
+    return private, public
+
+def public_key_bytes(public: X25519PublicKey) -> bytes:
+    """Serialize public key to bytes"""
+    return public.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+def derive_shared_key(private: X25519PrivateKey, peer_public_bytes: bytes) -> bytes:
+    peer_pub = X25519PublicKey.from_public_bytes(peer_public_bytes)
+    return private.exchange(peer_pub)  # returns 32-byte shared key
+
+def encrypt_msg(key: bytes, plaintext: str) -> str:
+    aes = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    ct = aes.encrypt(nonce, plaintext.encode("utf-8"), None)
+    envelope = {
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ct": base64.b64encode(ct).decode("ascii")
+    }
+    return json.dumps(envelope, separators=(",", ":"))
+
+def decrypt_msg(key: bytes, envelope_json: str) -> Optional[str]:
+    try:
+        env = json.loads(envelope_json)
+        nonce = base64.b64decode(env["nonce"])
+        ct = base64.b64decode(env["ct"])
+        aes = AESGCM(key)
+        pt = aes.decrypt(nonce, ct, None)
+        return pt.decode("utf-8")
+    except Exception:
+        return None
+
+# --- Message display ---
+def format_display(nick: str, msg: str, is_host: bool, is_dev: bool, origin_label: str) -> str:
+    ts_col = f"{ANSI_TIME}[{timestamp()}]{ANSI_RESET}"
+    if is_host:
+        style = ANSI_RED + ANSI_BOLD
+        prefix = "! "
+        name_part = f"[HOST] {nick}"
+    elif is_dev:
+        style = ANSI_YELLOW + ANSI_BOLD
+        prefix = "!! "
+        name_part = f"[DEV] {nick}"
+    else:
+        style = ANSI_CYAN
+        prefix = ""
+        name_part = f"{nick}@{origin_label}"
+    name_col = f"{style}{prefix}<{name_part}>{ANSI_RESET}"
+    return f"{ts_col} {name_col} {msg}"
+
+# --- Chat entities ---
+class ClientInfo:
+    def __init__(self, sock: socket.socket, addr: Tuple[str,int], session_key: bytes, nick: str):
+        self.sock = sock
+        self.addr = addr
+        self.key = session_key
+        self.nick = nick
+        self.is_dev = False  # Track dev status per client
+
+class ChatServer:
+    def __init__(self, port: int, nick: str, script_dir: str, is_dev: bool = False):
+        self.port = port
+        self.nick = nick
+        self.script_dir = script_dir
+        self.servauth = load_servauth(script_dir)  # Private file with password hash
+        self.clients: Dict[socket.socket, ClientInfo] = {}
+        self.lock = threading.Lock()
+        self.host_private, self.host_public = generate_x25519_keypair()
+        self.local_is_dev = is_dev  # whether host has authenticated as dev
+
+    def start(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", self.port))
+        s.listen(10)
+        dev_status = " (DEV mode)" if self.local_is_dev else ""
+        print(f"Hosting secure chat on port {self.port}{dev_status} — Ctrl+C to quit")
+        threading.Thread(target=self.accept_loop, args=(s,), daemon=True).start()
+        self.stdin_loop()
+        s.close()
+
+    def accept_loop(self, s: socket.socket):
+        while True:
+            try:
+                conn, addr = s.accept()
+            except Exception:
+                break
+            # Step 1: exchange public keys
+            try:
+                conn.sendall(base64.b64encode(public_key_bytes(self.host_public)) + b"\n")
+                client_pub_b64 = conn.recv(4096).strip()
+                client_pub_bytes = base64.b64decode(client_pub_b64)
+                session_key = derive_shared_key(self.host_private, client_pub_bytes)
+                # default nick: "anonX"
+                client_info = ClientInfo(conn, addr, session_key, f"anon{addr[1]}")
+                with self.lock:
+                    self.clients[conn] = client_info
+                print(f"[{timestamp()}] Client connected {addr}")
+                threading.Thread(target=self.client_handler, args=(client_info,), daemon=True).start()
+            except Exception as e:
+                print(f"Error during key exchange: {e}")
+                try: conn.close()
+                except: pass
+
+    def client_handler(self, client: ClientInfo):
+        buf = b""
+        while True:
+            try:
+                data = client.sock.recv(65536)
+                if not data:
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n",1)
+                    if not line: continue
+                    plaintext = decrypt_msg(client.key, line.decode("utf-8"))
+                    if plaintext is None:
+                        display = format_display("?", "<decrypt-failed>", False, False, f"{client.addr[0]}")
+                        print(display); save_history(display)
+                        continue
+                    obj = json.loads(plaintext)
+                    msg_type = obj.get("type","msg")
+
+                    # Handle dev authentication request from client
+                    if msg_type == "dev_auth":
+                        password = obj.get("password", "")
+                        if self.servauth and verify_servauth_blob(self.servauth, password):
+                            client.is_dev = True
+                            old_nick = client.nick
+                            if self.servauth.get("nick"):
+                                client.nick = self.servauth["nick"]
+                            notice = f"[System] {old_nick} authenticated as DEV ({client.nick})"
+                            self.broadcast_system(notice)
+                            # Send success back to client
+                            response = encrypt_msg(client.key, json.dumps({
+                                "type": "dev_auth_response",
+                                "success": True,
+                                "nick": client.nick
+                            }))
+                            try: client.sock.sendall((response+"\n").encode("utf-8"))
+                            except: pass
+                        else:
+                            # Send failure back to client
+                            response = encrypt_msg(client.key, json.dumps({
+                                "type": "dev_auth_response",
+                                "success": False
+                            }))
+                            try: client.sock.sendall((response+"\n").encode("utf-8"))
+                            except: pass
+                        continue
+
+                    if msg_type=="nick":
+                        old = client.nick
+                        client.nick = obj.get("nick","unknown")
+                        notice = f"[System] {old} changed nick to {client.nick}"
+                        self.broadcast_system(notice)
+                        continue
+                    # normal chat message
+                    display = format_display(client.nick, obj.get("msg",""), False, client.is_dev, f"{client.addr[0]}")
+                    print(display); save_history(display)
+                    # rebroadcast to all clients (including sender for echo)
+                    self.broadcast_message_to_all(client.nick, obj.get("msg",""), client.is_dev)
+            except Exception:
+                break
+        with self.lock:
+            try: del self.clients[client.sock]
+            except: pass
+        try: client.sock.close()
+        except: pass
+        print(f"[{timestamp()}] Client disconnected {client.addr}")
+
+    def broadcast_system(self, text: str):
+        display = format_display("System", text, False, False, "HOST")
+        print(display); save_history(display)
+        with self.lock:
+            for c in self.clients.values():
+                envelope = encrypt_msg(c.key, json.dumps({"type":"system","msg":text}))
+                try: c.sock.sendall((envelope+"\n").encode("utf-8"))
+                except: pass
+
+    def broadcast_message(self, sender: ClientInfo, msg: str):
+        with self.lock:
+            for c in self.clients.values():
+                envelope = encrypt_msg(c.key, json.dumps({
+                    "type":"msg",
+                    "msg":msg,
+                    "nick":sender.nick,
+                    "is_dev":sender.is_dev
+                }))
+                try: c.sock.sendall((envelope+"\n").encode("utf-8"))
+                except: pass
+
+    def broadcast_message_to_all(self, nick: str, msg: str, is_dev: bool):
+        """Broadcast message to all clients including echo back to sender"""
+        with self.lock:
+            for c in self.clients.values():
+                envelope = encrypt_msg(c.key, json.dumps({
+                    "type":"msg",
+                    "msg":msg,
+                    "nick":nick,
+                    "is_dev":is_dev,
+                    "is_host":False
+                }))
+                try: c.sock.sendall((envelope+"\n").encode("utf-8"))
+                except: pass
+
+    def broadcast_host_message(self, nick: str, msg: str, is_dev: bool):
+        """Broadcast host message to all clients and display locally (formatted only)"""
+        # Display formatted version locally (no raw text shown)
+        display = format_display(nick, msg, True, is_dev, "HOST")
+        print(display); save_history(display)
+        # Send to all clients
+        with self.lock:
+            for c in self.clients.values():
+                envelope = encrypt_msg(c.key, json.dumps({
+                    "type":"msg",
+                    "msg":msg,
+                    "nick":nick,
+                    "is_dev":is_dev,
+                    "is_host":True
+                }))
+                try: c.sock.sendall((envelope+"\n").encode("utf-8"))
+                except: pass
+
+    def stdin_loop(self):
+        local_nick = self.nick
+        print("Type messages or /nick newname to change your nick globally")
+
+        # Don't disable echo - keep terminal input visible
+        try:
+            while True:
+                rlist,_,_ = select.select([sys.stdin],[],[],0.1)
+                if rlist:
+                    line = sys.stdin.readline().rstrip("\n")
+                    if not line: continue
+
+                    # /dev handling - for runtime authentication only
+                    if line.startswith("/dev"):
+                        args = line.split(" ", 2)
+                        if len(args) >= 2:
+                            supplied = line.split(" ",1)[1]
+                        else:
+                            print("Usage: /dev <password>")
+                            print("Note: To run as dev from start, use: ./.dev host --port 9009")
+                            continue
+
+                        if not self.servauth:
+                            print("[System] No .servauth file found.")
+                            print("[System] Run with ./.dev to create dev credentials and start as dev.")
+                            continue
+
+                        ok = verify_servauth_blob(self.servauth, supplied)
+                        if ok:
+                            self.local_is_dev = True
+                            if self.servauth.get("nick"):
+                                local_nick = self.servauth["nick"]
+                            notice = f"[System] Host authenticated as DEV ({local_nick})"
+                            self.broadcast_system(notice)
+                        else:
+                            print("[System] Wrong dev password.")
+                        continue
+
+                    if line.startswith("/nick "):
+                        newnick = line.split(" ",1)[1].strip()
+                        old = local_nick
+                        local_nick = newnick
+                        notice = f"[System] {old} changed nick to {local_nick}"
+                        self.broadcast_system(notice)
+                        continue
+                    # broadcast as host
+                    self.broadcast_host_message(local_nick, line, self.local_is_dev)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+
+class ChatClient:
+    def __init__(self, host: str, port: int, nick: str, script_dir: str, is_dev: bool = False):
+        self.host = host
+        self.port = port
+        self.nick = nick
+        self.script_dir = script_dir
+        self.sock: Optional[socket.socket] = None
+        self.running = True
+        self.local_nick = nick
+        self.client_private, self.client_public = generate_x25519_keypair()
+        self.session_key: Optional[bytes] = None
+        self.local_is_dev = is_dev
+
+    def start(self):
+        s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        try: s.connect((self.host,self.port))
+        except Exception as e:
+            print(f"Cannot connect: {e}"); return
+        self.sock = s
+        # exchange keys
+        host_pub_b64 = s.recv(4096).strip()
+        host_pub_bytes = base64.b64decode(host_pub_b64)
+        s.sendall(base64.b64encode(public_key_bytes(self.client_public))+b"\n")
+        self.session_key = derive_shared_key(self.client_private, host_pub_bytes)
+
+        dev_status = " (DEV mode)" if self.local_is_dev else ""
+        print(f"Connected to {self.host}:{self.port}{dev_status}. Type /nick to change nick globally. Ctrl+C to quit.")
+
+        # If started as dev, authenticate immediately
+        if self.local_is_dev:
+            servauth = load_servauth(self.script_dir)
+            if servauth:
+                # Try to get password from environment variable first (for .dev wrapper)
+                dev_password = os.environ.get("_SERV_DEV_PASSWORD")
+                if dev_password:
+                    envelope = encrypt_msg(self.session_key, json.dumps({
+                        "type":"dev_auth",
+                        "password":dev_password
+                    }))
+                    try:
+                        self.sock.sendall((envelope+"\n").encode("utf-8"))
+                    except:
+                        print("[System] Failed to send authentication request.")
+                    # Clear the password from environment
+                    os.environ.pop("_SERV_DEV_PASSWORD", None)
+
+        if not self.local_is_dev:
+            print("To authenticate as dev: /dev <password> OR use the .dev wrapper")
+
+        threading.Thread(target=self.recv_loop,daemon=True).start()
+        self.stdin_loop()
+        try: s.close()
+        except: pass
+
+    def recv_loop(self):
+        buf = b""
+        while self.running:
+            try:
+                data = self.sock.recv(65536)
+                if not data:
+                    print("[System] Server closed connection.")
+                    break
+                buf += data
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n",1)
+                    if not line: continue
+                    plaintext = decrypt_msg(self.session_key, line.decode("utf-8"))
+                    if plaintext is None:
+                        display = format_display("?", "<decrypt-failed>", False, False, self.host)
+                        print(display); save_history(display)
+                        continue
+                    obj = json.loads(plaintext)
+                    ttype = obj.get("type","msg")
+
+                    # Handle dev auth response
+                    if ttype == "dev_auth_response":
+                        if obj.get("success"):
+                            self.local_is_dev = True
+                            if obj.get("nick"):
+                                self.local_nick = obj["nick"]
+                            print(f"[System] Authenticated as DEV ({self.local_nick})")
+                        else:
+                            print("[System] Wrong dev password.")
+                        continue
+
+                    if ttype=="nick" or ttype=="system":
+                        text = obj.get("msg","")
+                        display = format_display("System", text, False, False, self.host)
+                        print(display); save_history(display)
+                        continue
+                    msg_nick = obj.get("nick","unknown")
+                    # Check if message has dev flag and host flag
+                    is_dev = obj.get("is_dev", False)
+                    is_host = obj.get("is_host", False)
+                    display = format_display(msg_nick, obj.get("msg",""), is_host, is_dev, self.host)
+                    print(display); save_history(display)
+            except Exception:
+                break
+
+    def stdin_loop(self):
+        # Don't disable echo - keep terminal input visible
+        try:
+            while self.running:
+                rlist,_,_ = select.select([sys.stdin],[],[],0.1)
+                if rlist:
+                    line = sys.stdin.readline().rstrip("\n")
+                    if not line: continue
+
+                    # /dev handling (client-side) - runtime authentication only
+                    if line.startswith("/dev"):
+                        args = line.split(" ", 2)
+                        # Try to authenticate with server
+                        if len(args) >= 2:
+                            supplied = line.split(" ",1)[1]
+                        else:
+                            print("Usage: /dev <password>")
+                            print("Note: To run as dev from start, use: ./.dev connect hostname --port 9009")
+                            continue
+                        # Send auth request to server
+                        envelope = encrypt_msg(self.session_key, json.dumps({
+                            "type":"dev_auth",
+                            "password":supplied
+                        }))
+                        try:
+                            self.sock.sendall((envelope+"\n").encode("utf-8"))
+                        except:
+                            print("[System] Failed to send authentication request.")
+                        continue
+
+                    if line.startswith("/nick "):
+                        newnick = line.split(" ",1)[1].strip()
+                        old = self.local_nick
+                        self.local_nick = newnick
+                        # send global nick update
+                        envelope = encrypt_msg(self.session_key, json.dumps({"type":"nick","nick":newnick}))
+                        try: self.sock.sendall((envelope+"\n").encode("utf-8"))
+                        except: pass
+                        continue
+                    # normal message - send and wait for echo
+                    envelope = encrypt_msg(self.session_key, json.dumps({
+                        "type":"msg",
+                        "msg":line,
+                        "nick":self.local_nick
+                    }))
+                    try:
+                        self.sock.sendall((envelope+"\n").encode("utf-8"))
+                    except:
+                        print("[System] Failed to send message")
+                        continue
+        except KeyboardInterrupt:
+            print("\nDisconnecting...")
+            self.running = False
+
+# --- Argument parsing ---
+if __name__=="__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Secure terminal chat (.serv)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    ph = sub.add_parser("host")
+    ph.add_argument("--port", type=int, default=9009)
+    ph.add_argument("--nick", type=str, default=None)
+    ph.add_argument("--dev", action="store_true", help="Start as dev (requires .servauth)")
+    pc = sub.add_parser("connect")
+    pc.add_argument("host")
+    pc.add_argument("--port", type=int, default=9009)
+    pc.add_argument("--nick", type=str, default=None)
+    pc.add_argument("--dev", action="store_true", help="Start as dev (requires .servauth)")
+    args = parser.parse_args()
+    script_dir = os.getcwd()
+
+    if args.cmd=="host":
+        nick = args.nick or socket.gethostname()
+        is_dev = args.dev
+        if is_dev:
+            # Verify .servauth exists and authenticate
+            servauth = load_servauth(script_dir)
+            if not servauth:
+                print("Error: No .servauth file found. Create one first with /dev --set")
+                sys.exit(1)
+            try:
+                password = getpass.getpass("Enter dev password: ")
+            except Exception:
+                print("Cannot read password input.")
+                sys.exit(1)
+            if not verify_servauth_blob(servauth, password):
+                print("Wrong dev password.")
+                sys.exit(1)
+            if servauth.get("nick"):
+                nick = servauth["nick"]
+        server = ChatServer(port=args.port, nick=nick, script_dir=script_dir, is_dev=is_dev)
+        server.start()
+    elif args.cmd=="connect":
+        nick = args.nick or socket.gethostname()
+        is_dev = args.dev
+        if is_dev:
+            # Verify .servauth exists and get password
+            servauth = load_servauth(script_dir)
+            if not servauth:
+                print("Error: No .servauth file found. Ask the host to set up dev access.")
+                sys.exit(1)
+            try:
+                password = getpass.getpass("Enter dev password: ")
+            except Exception:
+                print("Cannot read password input.")
+                sys.exit(1)
+            # Store password in environment for client to use
+            os.environ["_SERV_DEV_PASSWORD"] = password
+        client = ChatClient(host=args.host, port=args.port, nick=nick, script_dir=script_dir, is_dev=is_dev)
+        client.start()
